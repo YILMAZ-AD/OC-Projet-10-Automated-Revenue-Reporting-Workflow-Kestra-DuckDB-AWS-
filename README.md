@@ -1,6 +1,5 @@
 #  Automated Revenue Reporting Workflow (Kestra-DuckDB-AWS)
 
-Bienvenue sur le dépôt de mon projet d'automatisation de pipeline de données ! Ce projet a été conçu pour répondre à un besoin métier réel d'un marchand de vin.
 
 ##  Le Contexte : Le problème de BottleNeck
 BottleNeck est un caviste prestigieux qui gère ses ventes sur deux fronts :
