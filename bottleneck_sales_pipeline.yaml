@@ -1,0 +1,411 @@
+id: bottleneck_ca_vins_pipeline
+namespace: bottleneck.data
+
+description: |
+  Pipeline mensuel BottleNeck : nettoyage, jointure, CA et z-score.
+  Utilisation de Python + DuckDB pour contourner les bugs du plugin JDBC natif.
+  Inclus : Validation de l'Étape 3 avec les valeurs exactes de Stéphane.
+
+
+
+tasks:
+  # ------------------------------------------------------------------
+  # 0. Ingestion automatique depuis le Cloud
+  # ------------------------------------------------------------------
+  - id: download_erp
+    type: io.kestra.plugin.core.http.Download
+    uri: "https://bottleneck-projet11-2026.s3.eu-west-3.amazonaws.com/Fichier_erp.xlsx"
+
+  - id: download_web
+    type: io.kestra.plugin.core.http.Download
+    uri: "https://bottleneck-projet11-2026.s3.eu-west-3.amazonaws.com/Fichier_web.xlsx"
+
+  - id: download_liaison
+    type: io.kestra.plugin.core.http.Download
+    uri: "https://bottleneck-projet11-2026.s3.eu-west-3.amazonaws.com/fichier_liaison.xlsx"
+  # ------------------------------------------------------------------
+  # 1. Nettoyage ERP
+  # ------------------------------------------------------------------
+  - id: clean_erp
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Script SQL de dédoublonnage ERP exécuté via Python/DuckDB"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas openpyxl duckdb -q
+    inputFiles:
+      erp.xlsx: "{{ outputs.download_erp.uri }}"
+    outputFiles:
+      - erp_clean.csv
+    script: |
+      import pandas as pd
+      import duckdb
+      
+      erp_raw = pd.read_excel('erp.xlsx')
+      
+      erp_clean = duckdb.sql("""
+        SELECT * EXCLUDE (rn) FROM (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) AS rn
+          FROM erp_raw
+          WHERE product_id IS NOT NULL
+            AND price IS NOT NULL
+            AND price > 0
+        ) WHERE rn = 1
+      """).df()
+      
+      erp_clean.to_csv('erp_clean.csv', index=False, sep=';', decimal=',')
+
+  - id: test_clean_erp
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Test Etape 3 : doublons, valeurs manquantes, 823 lignes exactes"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas -q
+    inputFiles:
+      erp_clean.csv: "{{ outputs.clean_erp.outputFiles['erp_clean.csv'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_csv("erp_clean.csv", sep=";", decimal=",")
+      # Test d'absence de doublons
+      assert not df["product_id"].duplicated().any(), "Doublons detectes"
+      # Test d'absence de valeurs manquantes
+      assert df["product_id"].notna().all(), "product_id manquant"
+      assert df["price"].notna().all(), "price manquant"
+      assert (df["price"] > 0).all(), "Prix negatif ou nul detecte"
+      # Stephane releve 825 lignes apres simple dedoublonnage (avant retrait des prix
+      # negatifs) ; une fois le nettoyage complet applique (dedup + prix > 0), il
+      # reste 823 lignes (2 produits a prix negatif retires : 5017 et 6594).
+      assert len(df) == 823, f"Erreur volumetrie ERP: {len(df)} lignes au lieu de 823"
+      print("OK - 823 produits ERP valides (825 apres dedoublonnage - 2 prix negatifs)")
+
+  # ------------------------------------------------------------------
+  # 2. Nettoyage Web
+  # ------------------------------------------------------------------
+  - id: clean_web
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Script SQL de dédoublonnage Web exécuté via Python/DuckDB"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas openpyxl duckdb -q
+    inputFiles:
+      web.xlsx: "{{ outputs.download_web.uri }}"
+    outputFiles:
+      - web_clean.csv
+    script: |
+      import pandas as pd
+      import duckdb
+      
+      web_raw = pd.read_excel('web.xlsx')
+      
+      web_clean = duckdb.sql("""
+        SELECT * EXCLUDE (rn) FROM (
+          SELECT sku, total_sales,
+                 ROW_NUMBER() OVER (PARTITION BY sku ORDER BY sku) AS rn
+          FROM web_raw
+          WHERE post_type = 'product'
+            AND sku IS NOT NULL
+        ) WHERE rn = 1
+      """).df()
+      
+      web_clean.to_csv('web_clean.csv', index=False, sep=';', decimal=',')
+
+  - id: test_clean_web
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Test Etape 3 : 714 lignes exactes"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas -q
+    inputFiles:
+      web_clean.csv: "{{ outputs.clean_web.outputFiles['web_clean.csv'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_csv("web_clean.csv", sep=";", decimal=",")
+      # Test d'absence de doublons
+      assert not df["sku"].duplicated().any(), "Doublons detectes"
+      # Test d'absence de valeurs manquantes
+      assert df["sku"].notna().all(), "sku manquant"
+      assert len(df) == 714, f"Erreur volumetrie Web: {len(df)} lignes au lieu de 714"
+      print("OK - 714 produits Web valides")
+
+  # ------------------------------------------------------------------
+  # 3. Nettoyage Liaison
+  # ------------------------------------------------------------------
+  - id: clean_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Script SQL de dédoublonnage Liaison exécuté via Python/DuckDB"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas openpyxl duckdb -q
+    inputFiles:
+      liaison.xlsx: "{{ outputs.download_liaison.uri }}"
+    outputFiles:
+      - liaison_clean.csv
+    script: |
+      import pandas as pd
+      import duckdb
+      
+      liaison_raw = pd.read_excel('liaison.xlsx')
+      
+      liaison_clean = duckdb.sql("""
+        SELECT * EXCLUDE (rn) FROM (
+          SELECT product_id, id_web,
+                 ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) AS rn
+          FROM liaison_raw
+          WHERE product_id IS NOT NULL
+            AND id_web IS NOT NULL
+        ) WHERE rn = 1
+      """).df()
+      
+      liaison_clean.to_csv('liaison_clean.csv', index=False, sep=';', decimal=',')
+
+  - id: test_clean_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Test Etape 3 : doublons, valeurs manquantes, 734 lignes exactes"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas -q
+    inputFiles:
+      liaison_clean.csv: "{{ outputs.clean_liaison.outputFiles['liaison_clean.csv'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_csv("liaison_clean.csv", sep=";", decimal=",")
+      # Test d'absence de doublons
+      assert not df["product_id"].duplicated().any(), "Doublons detectes"
+      # Test d'absence de valeurs manquantes
+      assert df["product_id"].notna().all(), "product_id manquant"
+      assert df["id_web"].notna().all(), "id_web manquant"
+      # Stephane releve 825 lignes apres simple dedoublonnage (avant retrait des
+      # id_web nuls) ; une fois le nettoyage complet applique (dedup + id_web non
+      # nul), il reste 734 lignes (91 produits non vendus en ligne retires).
+      assert len(df) == 734, f"Erreur volumetrie Liaison: {len(df)} lignes au lieu de 734"
+      print("OK - 734 correspondances valides (825 apres dedoublonnage - 91 id_web manquants)")
+
+  # ------------------------------------------------------------------
+  # 4. Jointures
+  # ------------------------------------------------------------------
+  - id: join_erp_web
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Jointures SQL via DuckDB"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas duckdb -q
+    inputFiles:
+      erp_clean.csv: "{{ outputs.clean_erp.outputFiles['erp_clean.csv'] }}"
+      liaison_clean.csv: "{{ outputs.clean_liaison.outputFiles['liaison_clean.csv'] }}"
+      web_clean.csv: "{{ outputs.clean_web.outputFiles['web_clean.csv'] }}"
+    outputFiles:
+      - fusion.csv
+    script: |
+      import pandas as pd
+      import duckdb
+      
+      erp_clean = pd.read_csv('erp_clean.csv', sep=";", decimal=",")
+      liaison_clean = pd.read_csv('liaison_clean.csv', sep=";", decimal=",")
+      web_clean = pd.read_csv('web_clean.csv', sep=";", decimal=",")
+      
+      fusion = duckdb.sql("""
+        SELECT el.*, w.total_sales
+        FROM (
+            SELECT e.*, l.id_web 
+            FROM erp_clean e 
+            JOIN liaison_clean l ON e.product_id = l.product_id
+        ) el
+        JOIN web_clean w ON el.id_web = w.sku
+      """).df()
+      
+      fusion.to_csv('fusion.csv', index=False, sep=';', decimal=',')
+
+  - id: test_jointure
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Test Etape 3 : Fichier fusionné à 714 lignes"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas -q
+    inputFiles:
+      fusion.csv: "{{ outputs.join_erp_web.outputFiles['fusion.csv'] }}"
+    script: |
+      import pandas as pd
+      fusion = pd.read_csv("fusion.csv", sep=";", decimal=",")
+      assert not fusion["product_id"].duplicated().any(), "Doublons crees par la jointure"
+      assert len(fusion) == 714, f"Erreur jointure: {len(fusion)} lignes au lieu de 714"
+      print("OK - 714 produits fusionnes avec succes")
+
+  # ------------------------------------------------------------------
+  # 5. Calcul CA
+  # ------------------------------------------------------------------
+  - id: compute_ca
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Calcul du CA en SQL via DuckDB"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas duckdb -q
+    inputFiles:
+      fusion.csv: "{{ outputs.join_erp_web.outputFiles['fusion.csv'] }}"
+    outputFiles:
+      - ca_par_produit.csv
+      - ca_total.csv
+    script: |
+      import pandas as pd
+      import duckdb
+      
+      fusion = pd.read_csv('fusion.csv', sep=";", decimal=",")
+      
+      ca_par_produit = duckdb.sql("""
+        SELECT product_id, price, total_sales,
+               ROUND(price * total_sales, 2) AS ca_produit
+        FROM fusion
+      """).df()
+      ca_par_produit.to_csv('ca_par_produit.csv', index=False, sep=';', decimal=',')
+      
+      ca_total = duckdb.sql("""
+        SELECT ROUND(SUM(ca_produit), 2) AS ca_total 
+        FROM ca_par_produit
+      """).df()
+      ca_total.to_csv('ca_total.csv', index=False, sep=';', decimal=',')
+
+  - id: test_calcul_ca
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Test Etape 3 : CA total = 70568.60"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install pandas -q
+    inputFiles:
+      ca_total.csv: "{{ outputs.compute_ca.outputFiles['ca_total.csv'] }}"
+    script: |
+      import pandas as pd
+      total = pd.read_csv("ca_total.csv", sep=";", decimal=",")["ca_total"].iloc[0]
+      assert abs(total - 70568.60) < 0.01, f"CA total incorrect: {total} au lieu de 70568.60"
+      print(f"OK - CA total verifie a {total} EUR")
+
+  # ------------------------------------------------------------------
+  # Branches parallèles (Excel & Vins)
+  # ------------------------------------------------------------------
+  - id: rapport_et_vins
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: branche_rapport_ca
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: extract_report_excel
+            type: io.kestra.plugin.scripts.python.Script
+            description: "Export propre en Excel via Pandas"
+            docker:
+              image: python:3.11-slim
+            beforeCommands:
+              - pip install pandas openpyxl -q
+            inputFiles:
+              ca_par_produit.csv: "{{ outputs.compute_ca.outputFiles['ca_par_produit.csv'] }}"
+              ca_total.csv: "{{ outputs.compute_ca.outputFiles['ca_total.csv'] }}"
+            outputFiles:
+              - rapport_ca.xlsx
+            script: |
+              import pandas as pd
+              ca_produit = pd.read_csv('ca_par_produit.csv', sep=";", decimal=",")
+              ca_total = pd.read_csv('ca_total.csv', sep=";", decimal=",")
+              
+              with pd.ExcelWriter('rapport_ca.xlsx') as writer:
+                  ca_produit.to_excel(writer, sheet_name='CA_par_produit', index=False)
+                  ca_total.to_excel(writer, sheet_name='CA_total', index=False)
+
+          - id: test_rapport
+            type: io.kestra.plugin.scripts.python.Script
+            docker:
+              image: python:3.11-slim
+            beforeCommands:
+              - pip install pandas openpyxl -q
+            inputFiles:
+              rapport_ca.xlsx: "{{ outputs.extract_report_excel.outputFiles['rapport_ca.xlsx'] }}"
+            script: |
+              import pandas as pd, os
+              assert os.path.getsize("rapport_ca.xlsx") > 0, "Fichier vide"
+              print("OK - Rapport Excel genere")
+
+      - id: branche_vins
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: identify_wines_zscore
+            type: io.kestra.plugin.scripts.python.Script
+            description: "Calcul du z-score sur les donnees fusionnees (714 lignes)"
+            docker:
+              image: python:3.11-slim
+            beforeCommands:
+              - pip install pandas -q
+            inputFiles:
+              fusion.csv: "{{ outputs.join_erp_web.outputFiles['fusion.csv'] }}"
+            outputFiles:
+              - erp_zscore.csv
+            script: |
+              import pandas as pd
+              # On lit le fichier fusion au lieu de l'ERP
+              df = pd.read_csv("fusion.csv", sep=";", decimal=",")
+              
+              # On utilise ddof=0 pour avoir l'écart-type de la population (méthode de Stéphane)
+              moyenne = df["price"].mean()
+              ecart_type = df["price"].std(ddof=0) 
+              
+              df["z_score"] = (df["price"] - moyenne) / ecart_type
+              df["categorie"] = df["z_score"].apply(lambda z: "premium" if z > 2 else "ordinaire")
+              df.to_csv("erp_zscore.csv", index=False, sep=';', decimal=',')
+
+          - id: test_zscore
+            type: io.kestra.plugin.scripts.python.Script
+            description: "Test Etape 3 : 30 vins premium exacts"
+            docker:
+              image: python:3.11-slim
+            beforeCommands:
+              - pip install pandas -q
+            inputFiles:
+              erp_zscore.csv: "{{ outputs.identify_wines_zscore.outputFiles['erp_zscore.csv'] }}"
+            script: |
+              import pandas as pd
+              df = pd.read_csv("erp_zscore.csv", sep=";", decimal=",")
+              nb_premium = (df["categorie"] == "premium").sum()
+              assert nb_premium == 30, f"Erreur: {nb_premium} vins premium trouves au lieu de 30"
+              print("OK - 30 vins premium verifies")
+
+          - id: extraction_vins
+            type: io.kestra.plugin.core.flow.Parallel
+            tasks:
+              - id: extract_vins_premium
+                type: io.kestra.plugin.scripts.python.Script
+                docker:
+                  image: python:3.11-slim
+                beforeCommands:
+                  - pip install pandas -q
+                inputFiles:
+                  erp_zscore.csv: "{{ outputs.identify_wines_zscore.outputFiles['erp_zscore.csv'] }}"
+                outputFiles:
+                  - vins_premium.csv
+                script: |
+                  import pandas as pd
+                  df = pd.read_csv('erp_zscore.csv', sep=";", decimal=",")
+                  df[df['categorie'] == 'premium'].to_csv('vins_premium.csv', index=False, sep=';', decimal=',')
+
+              - id: extract_vins_ordinaires
+                type: io.kestra.plugin.scripts.python.Script
+                docker:
+                  image: python:3.11-slim
+                beforeCommands:
+                  - pip install pandas -q
+                inputFiles:
+                  erp_zscore.csv: "{{ outputs.identify_wines_zscore.outputFiles['erp_zscore.csv'] }}"
+                outputFiles:
+                  - vins_ordinaires.csv
+                script: |
+                  import pandas as pd
+                  df = pd.read_csv('erp_zscore.csv', sep=";", decimal=",")
+                  df[df['categorie'] == 'ordinaire'].to_csv('vins_ordinaires.csv', index=False, sep=';', decimal=',')
+
+triggers:
+  - id: planification_mensuelle
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
