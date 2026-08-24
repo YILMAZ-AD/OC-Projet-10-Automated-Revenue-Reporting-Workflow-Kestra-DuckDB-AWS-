@@ -1,3 +1,5 @@
+🇫🇷 Français | readme in english 👉 [🇬🇧 English](README.en.md)
+
 #  Automated Revenue Reporting Workflow (Kestra-DuckDB-AWS)
 
 
